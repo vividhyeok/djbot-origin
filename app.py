@@ -17,6 +17,28 @@ import zipfile
 
 # Initialize
 ensure_dirs()
+
+# Set ffmpeg path for pydub
+try:
+    import imageio_ffmpeg
+    import shutil
+    _ffmpeg_src = imageio_ffmpeg.get_ffmpeg_exe()
+    _ffmpeg_dir = os.path.dirname(_ffmpeg_src)
+    _ffmpeg_exe = os.path.join(_ffmpeg_dir, 'ffmpeg.exe') if os.name == 'nt' else os.path.join(_ffmpeg_dir, 'ffmpeg')
+    
+    if not os.path.exists(_ffmpeg_exe):
+        shutil.copy2(_ffmpeg_src, _ffmpeg_exe)
+        
+    os.environ['PATH'] = _ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
+    from pydub import AudioSegment
+    AudioSegment.converter = _ffmpeg_exe
+except ImportError:
+    import shutil
+    ffmpeg_system = shutil.which("ffmpeg")
+    if ffmpeg_system:
+        from pydub import AudioSegment
+        AudioSegment.converter = ffmpeg_system
+
 analyzer = AudioAnalyzer()
 separator = StemSeparator()
 transition_engine = TransitionEngine()

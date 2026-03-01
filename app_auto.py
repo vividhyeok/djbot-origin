@@ -24,17 +24,20 @@ try:
     import shutil
     _ffmpeg_src = imageio_ffmpeg.get_ffmpeg_exe()
     _ffmpeg_dir = os.path.dirname(_ffmpeg_src)
-    _ffmpeg_exe = os.path.join(_ffmpeg_dir, 'ffmpeg.exe')
-    # imageio_ffmpeg binary has versioned name — create ffmpeg.exe copy
+    _ffmpeg_exe = os.path.join(_ffmpeg_dir, 'ffmpeg.exe') if os.name == 'nt' else os.path.join(_ffmpeg_dir, 'ffmpeg')
+    
     if not os.path.exists(_ffmpeg_exe):
         shutil.copy2(_ffmpeg_src, _ffmpeg_exe)
-    # Add to PATH so subprocess calls find it
+        
     os.environ['PATH'] = _ffmpeg_dir + os.pathsep + os.environ.get('PATH', '')
-    # Set pydub's converter
     from pydub import AudioSegment
     AudioSegment.converter = _ffmpeg_exe
-except Exception:
-    pass
+except ImportError:
+    import shutil
+    ffmpeg_system = shutil.which("ffmpeg")
+    if ffmpeg_system:
+        from pydub import AudioSegment
+        AudioSegment.converter = ffmpeg_system
 analyzer = AudioAnalyzer()
 transition_engine = TransitionEngine()
 renderer = MixRenderer()

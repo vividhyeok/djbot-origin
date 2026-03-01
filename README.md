@@ -1,123 +1,92 @@
 # 🎧 DJ Bot — 자동 DJ 믹스 생성기
 
-YouTube 재생목록 또는 로컬 음악 파일을 입력하면, 자동으로 분석 → 하모닉 정렬 → 크로스페이드 믹싱하여 하나의 DJ 믹스 MP3를 생성합니다.
+YouTube 재생목록 또는 로컬 음악 파일을 입력하면, 자동으로 분석 → 하모닉 정렬 → 크로스페이드 믹싱하여 하나의 DJ 믹스 MP3를 생성하는 툴입니다.
 
 ## ✨ 주요 기능
 
-- **YouTube 재생목록 다운로드** — YouTube/YouTube Music 재생목록 URL 입력 → 자동 다운로드
-- **Camelot Wheel 하모닉 정렬** — Key + BPM 기반 최적 트랙 순서 자동 결정
-- **8바 크로스페이드 믹싱** — BPM 기반 자연스러운 전환 (곡당 ~60초 하이라이트)
-- **Go 기반 고속 분석** — BPM, Key, 에너지, 구조(Intro/Verse/Chorus/Bridge/Outro) 자동 감지
-- **LRC 트랙리스트** — 믹스 MP3와 함께 타임스탬프 트랙리스트 생성
-- **중복 곡 자동 제거** — 같은 제목의 중복 트랙 필터링
+- **YouTube 재생목록 자동 다운로드** — 재생목록 URL 입력 시 자동 추출 및 다운로드
+- **Camelot Wheel 하모닉 정렬** — Key + BPM 기반 가장 자연스럽게 이어지는 곡 순서 결정
+- **크로스페이드 믹싱** — 8바 단위의 부드러운 전환, 곡당 가장 좋은 하이라이트 구간 위주로 플레이
+- **LRC 트랙리스트** — 최종 생성된 MP3 믹스 파일에 대한 타임스탬프 파일 함께 제공
+- **빠른 음원 분석** — 포함된 내장 Go Worker를 통해 BPM, Key, 에너지 레벨 초고속 측정
 
-## 🏗️ 아키텍처
+---
 
-```
-djbot/
-├── app_auto.py              # Streamlit 메인 앱 (자동 믹스)
-├── app.py                   # Streamlit 메인 앱 (수동 믹스)
-├── src/
-│   ├── analyzer_engine.py   # 오디오 분석 (BPM, Key, 에너지, 구조)
-│   ├── transition_engine.py # 전환 후보 생성 및 선택
-│   ├── mix_renderer.py      # 믹스 렌더러 (WAV 변환 + pydub 크로스페이드)
-│   ├── youtube_downloader.py# YouTube 재생목록 다운로드 (yt-dlp)
-│   ├── go_bridge.py         # Go worker 프로세스 관리
-│   ├── stem_separator.py    # 스템 분리 (선택사항)
-│   └── utils.py             # 유틸리티 함수 및 로깅
-├── goworker/
-│   ├── main.go              # Go HTTP 서버 (분석 API)
-│   ├── analyzer.go          # BPM/Key/에너지 분석
-│   ├── dsp.go               # DSP 함수 (FFT, 필터)
-│   ├── renderer.go          # Go 믹스 렌더러
-│   ├── types.go             # 타입 정의
-│   └── goworker.exe         # 컴파일된 바이너리
-└── output/                  # 생성된 믹스 파일
-```
+## 🔧 새로운 환경 셋업 가이드
 
-## 🔧 설치
+본 프로젝트는 이미 포함된 `goworker` 실행 파일을 사용하므로 추가적인 빌드 작업 없이 Python 환경만 구성하면 즉시 실행 가능합니다.
 
-### 요구사항
-- Python 3.10+
-- Go 1.21+ (goworker 빌드 시)
+### 1️⃣ 요구사항
+- **Python 3.10 이상**
+- `ffmpeg` (아래 가이드에 따라 자동 혹은 수동 설치)
 
-### Python 패키지
+### 2️⃣ 의존성 설치 환경 구성
+
+가급적 가상 환경(Virtual Environment)을 만들어 진행하는 것을 권장합니다.
 
 ```bash
-pip install streamlit pydub librosa yt-dlp imageio-ffmpeg scipy numpy soundfile
+# 가상 환경 생성 (선택 사항)
+python -m venv venv
+
+# 가상 환경 활성화 (Windows)
+venv\Scripts\activate
+
+# 가상 환경 활성화 (Mac/Linux)
+source venv/bin/activate
 ```
 
-> `imageio-ffmpeg`이 ffmpeg 바이너리를 자동으로 설치합니다. 별도 ffmpeg 설치 불필요.
-
-### Go Worker 빌드 (선택사항)
+프로젝트 폴더에서 다음 명령어를 실행하여 필요한 Python 패키지들을 일괄 설치합니다.
 
 ```bash
-cd goworker
-go build -o goworker.exe .
+pip install -r requirements.txt
 ```
 
-> 사전 빌드된 `goworker.exe`가 이미 포함되어 있습니다.
+> **💡 FFMPEG 관련 안내**  
+> 위 명령어 실행 시 `imageio-ffmpeg` 패키지가 함께 설치되며, 이 패키지가 코드 실행에 필요한 `ffmpeg` 바이너리를 임시로 제공합니다. 만약 작동 과정에서 ffmpeg 관련 에러가 지속 발생한다면, 시스템에 [ffmpeg를 직접 설치](https://ffmpeg.org/download.html)하고 시스템 환경 변수(PATH)에 등록하면 코드가 자동으로 이를 감지하여 실행됩니다.
 
-## 🚀 실행
+### 3️⃣ (옵션) FFMPEG 시스템 경로 추가 유틸리티
+Windows 환경에서 `imageio-ffmpeg`가 다운로드한 ffmpeg를 시스템 PATH에 영구적으로 등록하고 싶다면 포함된 셋업 스크립트를 실행해 보세요.
 
 ```bash
-# 자동 믹스 모드 (권장)
+python setup_ffmpeg.py
+```
+*(실행 후 터미널 또는 IDE를 재시작해야 적용될 수 있습니다.)*
+
+---
+
+## 🚀 실행 방법
+
+두 가지 모드의 Streamlit 앱으로 동작합니다. 터미널(또는 명령 프롬프트)에서 아래 명령어를 실행하세요. 명렁어 실행 후 브라우저가 자동으로 열리며 웹 UI 화면이 나타납니다.
+
+### 자동 믹스 모드 (추천 🌟)
+YouTube 링크만으로 원클릭 전자동 믹스를 만들어 내는 메인 모드입니다.
+```bash
 python -m streamlit run app_auto.py
+```
 
-# 수동 믹스 모드
+### 수동 믹스 및 분석 모드
+로컬 파일들을 업로드하여 직접 전환 구간이나 믹스 옵션을 들어보며 선택하는 고급 모드입니다.
+```bash
 python -m streamlit run app.py
 ```
 
-브라우저에서 `http://localhost:8501` 접속
+---
 
-## 📖 사용법
+## 💡 사용 방법 (app_auto.py 기준)
+1. 좌측 사이드바에 **YouTube 재생목록 URL** (예: `music.youtube.com/playlist?list=...`)을 붙여넣기 합니다. (또는 직접 음악 파일 여러 개를 업로드해도 됩니다.)
+2. **"🚀 다운로드 & 자동 믹스"** 버튼을 클릭합니다.
+3. 영상 다운로드 → 추출 → 내부 Go Worker를 활용한 초고속 분석이 진행됩니다.
+4. 분석이 끝나면 **"⚡ 원클릭 자동 믹스 생성"**을 누릅니다. AI가 자체적으로 곡의 Key와 BPM, 에너지를 고려하여 최적의 순서를 세우고 크로스페이드 지점을 계획합니다.
+5. 계획이 시각적으로 표시되면 하단 **"🎧 최종 믹스 렌더링"**을 클릭해 하나의 긴 DJ 믹스 MP3를 만들어냅니다.
+6. 완료되면 화면 하단에서 MP3와 구간별 LRC 가사 파일이 합쳐진 ZIP 파일을 다운로드 받으실 수 있습니다.
 
-### 자동 믹스 (app_auto.py)
+---
 
-1. 좌측 사이드바에서 **YouTube 재생목록 URL** 입력
-2. **"🚀 다운로드 & 자동 믹스"** 클릭
-3. 자동으로 다운로드 → 분석 → 하모닉 정렬 → 믹스 계획
-4. **"🎧 최종 믹스 렌더링"** 클릭으로 MP3 생성
-5. ZIP 다운로드 (MP3 + LRC 트랙리스트)
+## ⚠️ 문제 해결 FAQ
 
-### 수동 믹스 (app.py)
-
-1. MP3/WAV 파일 업로드
-2. Go worker가 자동 분석 (BPM, Key, 구조)
-3. 트랙 순서 조정 및 전환 편집
-4. In/Out 포인트 수동 설정 가능
-
-## 🎛️ 믹싱 알고리즘
-
-### Camelot Wheel 하모닉 정렬
-Key 호환성을 Camelot Wheel 기준으로 점수화:
-- **같은 키 / 관계조**: 100점
-- **인접 위치 (±1)**: 80점
-- **2단계 거리**: 40점
-
-### BPM 매칭
-- **±3 BPM 이내**: 50점
-- **±8 BPM 이내**: 35점
-- **±25 BPM 초과**: -30점 (페널티)
-
-### 크로스페이드
-- 8바 기준 크로스페이드 (BPM에 비례)
-- pydub 네이티브 크로스페이드 사용 → 정확한 타이밍
-- 모든 트랙 WAV 프리컨버팅 → 타이밍 드리프트 제거
-
-## 📋 기술 스택
-
-| 구성요소 | 기술 |
-|---------|------|
-| UI | Streamlit 1.52 |
-| 오디오 분석 | Go worker (FFT, autocorrelation) |
-| 오디오 렌더링 | pydub + ffmpeg (via imageio-ffmpeg) |
-| 다운로드 | yt-dlp |
-| Key 감지 | Krumhansl-Schmuckler algorithm |
-| 비트 감지 | Onset detection + autocorrelation |
-
-## ⚠️ 참고
-
-- YouTube Music URL (`music.youtube.com`)은 자동으로 `www.youtube.com`으로 변환됩니다
-- Chrome이 실행 중이면 쿠키 접근이 제한될 수 있습니다 (403 에러 시 Chrome 종료 후 재시도)
-- 첫 실행 시 WAV 변환에 시간이 걸리지만, 이후 캐시됩니다
+- **Q: `FileNotFoundError: [WinError 2] 지정된 파일을 찾을 수 없습니다` 에러가 납니다.**
+  - **A:** `ffmpeg`가 제대로 설치되지 않았거나 시스템이 찾지 못하는 문제입니다. `pip install -r requirements.txt` 가 잘 완료되었는지 확인하시거나, [ffmpeg 공식 홈페이지](https://ffmpeg.org/)에서 다운받아 시스템 PATH에 직접 설정해 주세요.
+- **Q: 유튜브 다운로드가 진행되다 `bot` 의심 관련 403 에러로 멈춥니다.**
+  - **A:** 로그인 된 브라우저의 쿠키를 끌어와 다운로드하는 방식을 취하고 있어, 크롬 브라우저가 실행중이면 잠겨서 접근이 안될 수 있습니다. **사용 중인 웹 브라우저를 모두 완전히 종료**한 뒤 다시 시도해 보세요.
+- **Q: Go Worker가 실행되지 않는다는 에러가 뜹니다.**
+  - **A:** `djbot-origin/goworker/goworker.exe` 파일이 존재하는지 확인해주세요. 바이너리가 없다면 Go 1.21+ 버전을 PC에 설치 후 터미널에서 `cd goworker` 후 `go build -o goworker.exe .` 명령어로 빌드해 주어야 합니다.
