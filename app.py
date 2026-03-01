@@ -360,14 +360,35 @@ if st.session_state.get('candidates'):
             col2.markdown(f"`{float(track['bpm']):.0f} BPM` | `{track.get('key', '?')}`")
             
             with st.expander(f"⚙️ 곡 재생 구간 조절 (현재: ~{int(track.get('manual_out', dur) - track.get('manual_in', 0))}초)"):
+                st.audio(track['filepath'], format="audio/mp3")
+                
                 m_in = st.slider("시작 (초)", 0.0, dur, track.get('manual_in', 0.0), key=f"in_{i}")
                 m_out = st.slider("종료 (초)", 0.0, dur, track.get('manual_out', dur), key=f"out_{i}")
+                
                 if m_in != track.get('manual_in', 0.0) or m_out != track.get('manual_out', dur):
                     track['manual_in'] = m_in
                     track['play_start'] = m_in
                     track['manual_out'] = m_out
                     track['play_end'] = m_out
-                    if st.button("🔄 이 곡 주변 트랜지션 다시 계산", key=f"recalc_{i}"):
+                    
+                col_btn1, col_btn2 = st.columns(2)
+                with col_btn1:
+                    if st.button("▶️ 선택 구간만 미리듣기", key=f"preview_slice_{i}", use_container_width=True):
+                        with st.spinner("구간 추출 중..."):
+                            try:
+                                from pydub import AudioSegment
+                                audio = AudioSegment.from_file(track['filepath'])
+                                slice_audio = audio[int(m_in * 1000) : int(m_out * 1000)]
+                                temp_dir = Path("cache/previews")
+                                temp_dir.mkdir(exist_ok=True, parents=True)
+                                temp_path = str(temp_dir / f"slice_{i}_{int(m_in)}_{int(m_out)}.mp3")
+                                slice_audio.export(temp_path, format="mp3")
+                                st.audio(temp_path, format="audio/mp3")
+                            except Exception as e:
+                                st.error(f"오디오 추출 실패: {e}")
+                                
+                with col_btn2:
+                    if st.button("🔄 이 곡 주변 트랜지션 다시 계산", key=f"recalc_{i}", use_container_width=True):
                         on_timing_change(i)
                         st.rerun()
 
