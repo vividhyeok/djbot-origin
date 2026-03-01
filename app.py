@@ -11,6 +11,7 @@ from src.analyzer_engine import AudioAnalyzer
 from src.stem_separator import StemSeparator
 from src.transition_engine import TransitionEngine
 from src.mix_renderer import MixRenderer
+from src.youtube_downloader import download_playlist_batch
 from src.utils import ensure_dirs, logger, get_file_hash
 import json
 import zipfile
@@ -80,10 +81,10 @@ def load_preference_weights():
         8: 1.5
     }
 
-st.set_page_config(layout="wide", page_title="AutoMix DJ Bot")
+st.set_page_config(layout="wide", page_title="Semi-Auto DJ Bot")
 
-st.title("🎧 AutoMix Hip-Hop DJ Bot")
-st.markdown("Automated Mixset Generator with Highlight Preservation")
+st.title("🎧 Semi-Auto Hip-Hop DJ Bot")
+st.markdown("자동 분석과 세밀한 커스터마이징을 지원하는 반자동 믹스 모드입니다. **타임라인** 기반으로 곡의 길이와 트랜지션을 조절하세요.")
 
 # Session State
 if 'playlist' not in st.session_state:
@@ -99,409 +100,351 @@ if 'type_weights' not in st.session_state:
 if 'final_mix_result' not in st.session_state:
     st.session_state['final_mix_result'] = None
 
-# Helper to load tracks
-def load_tracks(uploaded_files):
-    import time as time_module
+# --- Sorting & Auto-Planning Algorithms (Imported from Auto context) ---
+_CAMELOT = {
+    ('C', 'Major'): (8, 'B'), ('G', 'Major'): (9, 'B'), ('D', 'Major'): (10, 'B'),
+    ('A', 'Major'): (11, 'B'), ('E', 'Major'): (12, 'B'), ('B', 'Major'): (1, 'B'),
+    ('F#', 'Major'): (2, 'B'), ('C#', 'Major'): (3, 'B'), ('G#', 'Major'): (4, 'B'),
+    ('D#', 'Major'): (5, 'B'), ('A#', 'Major'): (6, 'B'), ('F', 'Major'): (7, 'B'),
+    ('A', 'Minor'): (8, 'A'), ('E', 'Minor'): (9, 'A'), ('B', 'Minor'): (10, 'A'),
+    ('F#', 'Minor'): (11, 'A'), ('C#', 'Minor'): (12, 'A'), ('G#', 'Minor'): (1, 'A'),
+    ('D#', 'Minor'): (2, 'A'), ('A#', 'Minor'): (3, 'A'), ('F', 'Minor'): (4, 'A'),
+    ('C', 'Minor'): (5, 'A'), ('G', 'Minor'): (6, 'A'), ('D', 'Minor'): (7, 'A'),
+}
+
+def _to_camelot(key_str):
+    try:
+        parts = key_str.strip().split(' ')
+        return _CAMELOT.get((parts[0], parts[1] if len(parts) > 1 else 'Major'), (1, 'B'))
+    except: return (1, 'B')
+
+def get_key_distance(key1, key2):
+    n1, l1 = _to_camelot(key1)
+    n2, l2 = _to_camelot(key2)
+    num_dist = min(abs(n1 - n2), 12 - abs(n1 - n2))
+    return num_dist if l1 == l2 else (0 if num_dist == 0 else num_dist + 1)
+
+def smart_sort_playlist(playlist):
+    if len(playlist) <= 2: return playlist
+    start = min(playlist, key=lambda t: float(t['bpm']))
+    sorted_list = [start]
+    remaining = [t for t in playlist if t is not start]
+    while remaining:
+        current = sorted_list[-1]
+        cur_bpm, cur_key = float(current['bpm']), current.get('key', 'C Major')
+        best_score, best_track = -999, None
+        for track in remaining:
+            t_bpm, t_key = float(track['bpm']), track.get('key', 'C Major')
+            key_dist = get_key_distance(cur_key, t_key)
+            key_score = 100 if key_dist == 0 else 80 if key_dist == 1 else 40 if key_dist == 2 else max(0, 20 - key_dist * 8)
+            bpm_diff = abs(t_bpm - cur_bpm)
+            bpm_score = 50 if bpm_diff < 3 else 35 if bpm_diff < 8 else 15 if bpm_diff < 15 else 0 if bpm_diff < 25 else -30
+            total = key_score + bpm_score
+            if total > best_score:
+                best_score = total; best_track = track
+        sorted_list.append(best_track)
+        remaining.remove(best_track)
+    return sorted_list
+
+def dedup_tracks(tracks):
+    seen = set()
+    result = []
+    for t in tracks:
+        name = os.path.splitext(os.path.basename(t.get('filepath', t.get('filename', ''))))[0].lower().strip()
+        if name and name not in seen:
+            seen.add(name); result.append(t)
+    return result
+
+# Helper to load tracks from files
+def load_tracks_from_files(uploaded_files):
     tracks = []
     seen_hashes = set()
-    
-    # Save uploaded files to temp/cache so we can access by path
     temp_dir = Path("cache/uploads")
     temp_dir.mkdir(exist_ok=True, parents=True)
-    
     total_files = len(uploaded_files)
     progress_bar = st.progress(0)
     status_text = st.empty()
-    time_text = st.empty()
-    
-    start_time = time_module.time()
     
     for i, uploaded_file in enumerate(uploaded_files):
-        file_start = time_module.time()
-        
         status_text.text(f"📊 Analyzing {i+1}/{total_files}: {uploaded_file.name}")
-        
-        # Save file
         file_path = temp_dir / uploaded_file.name
         with open(file_path, "wb") as f:
             f.write(uploaded_file.getbuffer())
-        
-        # Analyze
-        # Skip stem separation for now due to TorchCodec dependency issues
         try:
             file_hash = get_file_hash(str(file_path))
-            if file_hash in seen_hashes:
-                status_text.text(f"⏭️ Skipping duplicate: {uploaded_file.name}")
-                continue
+            if file_hash in seen_hashes: continue
             seen_hashes.add(file_hash)
 
-            stems = {}  # Empty stems dict - skip Demucs
+            stems = {}
             analysis = analyzer.analyze_track(str(file_path), stems)
             analysis['filename'] = uploaded_file.name
             analysis['filepath'] = str(file_path)
             analysis['stems'] = stems
             tracks.append(analysis)
-            
         except Exception as e:
             st.error(f"Error analyzing {uploaded_file.name}: {e}")
-        
-        # Update progress
-        progress = (i + 1) / total_files
-        progress_bar.progress(progress)
-        
-        # Calculate time estimates
-        elapsed = time_module.time() - start_time
-        if i > 0:
-            avg_time_per_file = elapsed / (i + 1)
-            remaining_files = total_files - (i + 1)
-            estimated_remaining = avg_time_per_file * remaining_files
-            
-            elapsed_str = f"{int(elapsed)}s"
-            remaining_str = f"{int(estimated_remaining)}s"
-            time_text.text(f"⏱️ Elapsed: {elapsed_str} | Remaining: ~{remaining_str}")
-        
-    total_time = time_module.time() - start_time
-    status_text.text(f"✅ Analysis Complete! ({int(total_time)}s total)")
-    time_text.empty()
+        progress_bar.progress((i + 1) / total_files)
     
+    status_text.text(f"✅ Analysis Complete! ({len(tracks)} tracks)")
     return tracks
 
-# UI Layout
+# Helper to load tracks from YouTube
+def load_tracks_from_youtube(yt_url):
+    tracks = []
+    with st.status("📥 YouTube에서 다운로드 및 분석 중...", expanded=True) as dl_status:
+        status_text = st.empty()
+        def update_status(text): dl_status.write(text)
+        downloaded = download_playlist_batch(yt_url, progress_callback=update_status)
+        if not downloaded:
+            st.error("❌ 다운로드된 곡이 없습니다. URL을 확인해주세요.")
+            return []
+            
+        seen_titles = set()
+        unique = []
+        for d in downloaded:
+            key = d['title'].lower().strip()
+            if key not in seen_titles:
+                seen_titles.add(key)
+                unique.append(d)
+                
+        total = len(unique)
+        for i, d in enumerate(unique):
+            dl_status.write(f"📊 분석 중 {i+1}/{total}: {d['title']}")
+            try:
+                analysis = analyzer.analyze_track(d['filepath'], {})
+                analysis['filename'] = d['title']
+                analysis['filepath'] = d['filepath']
+                analysis['stems'] = {}
+                tracks.append(analysis)
+            except Exception as e:
+                st.warning(f"⚠️ {d['title']} 분석 실패: {e}")
+                
+        tracks = dedup_tracks(tracks)
+        dl_status.update(label=f"✅ {len(tracks)}곡 완료!", state="complete")
+        return tracks
+
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("1. Upload Music")
-    uploaded_files = st.file_uploader("Select MP3/WAV files", accept_multiple_files=True, type=['mp3', 'wav'])
+    st.header("1. 입력 방식 선택")
     
-    if uploaded_files and st.button("Analyze Tracks"):
-        st.session_state['playlist'] = load_tracks(uploaded_files)
-        st.session_state['candidates'] = [] # Reset candidates
-        st.session_state['transitions'] = [None] * (len(st.session_state['playlist']) - 1)
-        st.rerun()
+    input_mode = st.radio("입력 방식", ["🔗 YouTube 재생목록 URL", "📁 파일 업로드"], label_visibility="collapsed")
+    
+    if input_mode == "🔗 YouTube 재생목록 URL":
+        yt_url = st.text_input("YouTube URL 입력", placeholder="https://youtube.com/playlist?list=...")
+        if yt_url and st.button("🚀 다운로드 및 로드", type="primary", use_container_width=True):
+            loaded = load_tracks_from_youtube(yt_url)
+            if len(loaded) >= 2:
+                st.session_state['playlist'] = loaded
+                st.session_state['candidates'] = []
+                st.session_state['final_mix_result'] = None
+                st.rerun()
+            else:
+                st.error("❌ 너무 적은 곡이 다운로드 되었습니다.")
+    else:
+        uploaded_files = st.file_uploader("MP3/WAV 파일 선택", accept_multiple_files=True, type=['mp3', 'wav'])
+        if uploaded_files and st.button("📊 업로드 및 분석", type="primary", use_container_width=True):
+            loaded = load_tracks_from_files(uploaded_files)
+            if len(loaded) >= 2:
+                st.session_state['playlist'] = loaded
+                st.session_state['candidates'] = []
+                st.session_state['final_mix_result'] = None
+                st.rerun()
     
     st.divider()
     
     # Weight Management
-    with st.expander("⚙️ Preference Weights", expanded=False):
-        st.caption("Learned from test_app.py training")
-        
-        st.write("**Transition Types:**")
+    with st.expander("⚙️ 트랜지션 선호도 설정", expanded=False):
         for t_type in ['crossfade', 'bass_swap', 'cut', 'filter_fade', 'mashup']:
             st.session_state['type_weights'][t_type] = st.slider(
-                t_type.replace('_', ' ').title(),
-                0.1, 10.0,
-                float(st.session_state['type_weights'].get(t_type, 1.0)),
-                0.1,
-                key=f"weight_{t_type}"
+                t_type, 0.1, 10.0, float(st.session_state['type_weights'].get(t_type, 1.0)), 0.1, key=f"weight_{t_type}"
             )
-        
-        st.write("**Bar Lengths:**")
-        st.caption("4/8 bar transition preference (learned + manual tuning)")
-        for bars in [4, 8]:
-            st.session_state['bar_weights'][bars] = st.slider(
-                f"{bars} Bars",
-                0.1, 10.0,
-                float(st.session_state['bar_weights'].get(bars, 1.0)),
-                0.1,
-                key=f"weight_{bars}bar"
-            )
-        
         col1, col2 = st.columns(2)
-        if col1.button("💾 Save Weights"):
-            import json
-            data = {
-                'types': st.session_state['type_weights'],
-                'bars': st.session_state['bar_weights'],
-                'features': {},
-                'structure': {}
-            }
+        if col1.button("💾 저장"):
+            data = {'types': st.session_state['type_weights'], 'bars': st.session_state['bar_weights']}
             with open("preference_weights.json", 'w') as f:
                 json.dump(data, f, indent=2)
-            st.success("Saved!")
-        
-        if col2.button("🔄 Reload"):
-            type_w, bar_w = load_preference_weights()
-            st.session_state['type_weights'] = type_w
-            st.session_state['bar_weights'] = bar_w
-            st.rerun()
+            st.success("저장 완료")
 
-# Main Area
-if st.session_state['playlist']:
-    st.header("2. Arrange & Mix")
-    
-    col_list, col_mix = st.columns([1, 2])
-    
-    with col_list:
-        st.subheader("Playlist Order")
-        
-        for i, track in enumerate(st.session_state['playlist']):
-            # Show Volume info
-            vol_info = f"{track.get('loudness_db', -99):.1f}dB"
-            st.markdown(f"**{i+1}. {track['filename']}** ({int(track['bpm'])} BPM, {vol_info})")
+# --- MAIN AREA ---
+if not st.session_state['playlist']:
+    st.info("👈 좌측에서 YouTube 재생목록 URL을 입력하거나 파일을 업로드하여 믹싱을 시작하세요.")
+    st.stop()
+
+st.header(f"2. 반자동 믹스 구성 ({len(st.session_state['playlist'])} 곡)")
+
+# AUTO-PLANNER BUTTON
+if not st.session_state.get('candidates'):
+    if st.button("⚡ Smart Auto-Plan (초기 자동 구성)", type="primary", use_container_width=True):
+        with st.status("🧠 AI 곡 정렬 및 트랜지션 계획 중...", expanded=True) as status:
+            playlist = st.session_state['playlist']
             
-            # Manual Highlight (Advanced)
-            with st.expander(f"🎛️ Manual 구간 설정 (Track {i+1})"):
-                dur = float(track['duration'])
+            # Smart Sort
+            status.write("🎯 Step 1: Harmonic 기반 스마트 곡 정렬...")
+            st.session_state['playlist'] = smart_sort_playlist(playlist)
+            playlist = st.session_state['playlist']
+            
+            # Apply initial timings (~60s per track based on highlights)
+            for t in playlist:
+                dur = float(t['duration'])
+                hl = t.get('highlights', [])
+                if len(dur > 90 and hl) > 0:
+                    center = (hl[0].get('start', dur*0.3) + hl[0].get('end', dur*0.6)) / 2
+                else:
+                    center = dur * 0.4
+                t['manual_in'] = max(0, center - 35)
+                t['manual_out'] = min(dur, center + 35)
                 
-                # Default values if not set
-                cur_in = float(track.get('manual_in', 0.0))
-                cur_out = float(track.get('manual_out', dur))
+            # Generate Transitions
+            status.write("🎲 Step 2: 최적 트랜지션 탐색 중...")
+            cw = {'types': st.session_state['type_weights'], 'bars': st.session_state['bar_weights']}
+            best_cands = []
+            cur_entry_times = {0: 0.0}
+            for i in range(len(playlist)-1):
+                t_a = playlist[i]; t_b = playlist[i+1]
+                t_a['play_end'] = t_a['manual_out']
+                t_b['play_start'] = t_b['manual_in']
+                opts = transition_engine.generate_random_candidates(t_a, t_b, count=6, weights=cw)
+                best = transition_engine.select_best_candidate(opts, weights=cw, min_exit_time=cur_entry_times.get(i, 0))
                 
-                # Slider for In/Out points
-                m_in = st.slider(f"Mix-In 시작 (초)", 0.0, dur, cur_in, step=1.0, key=f"in_{i}")
-                m_out = st.slider(f"Mix-Out 종료 (초)", 0.0, dur, cur_out, step=1.0, key=f"out_{i}")
+                # Re-sort opts so 'best' is first
+                opts.remove(best)
+                opts.insert(0, best)
                 
-                if m_in != cur_in: 
+                cur_entry_times[i+1] = best['b_in_time']
+                best_cands.append(opts)
+            
+            status.write("🎨 Step 3: 트랜지션 오디오 미리보기 렌더링...")
+            for i, opts in enumerate(best_cands):
+                if not opts[0].get('preview_path'):
+                    opts[0]['preview_path'] = renderer.render_preview(playlist[i]['filepath'], playlist[i+1]['filepath'], opts[0])
+                st.session_state[f"trans_{i}"] = 0
+            
+            st.session_state['candidates'] = best_cands
+            status.update(label="✅ 초기 구성 완료! 타임라인에서 세부 조절하세요.", state="complete")
+        st.rerun()
+
+# TIMELINE UI
+if st.session_state.get('candidates'):
+    st.subheader("타임라인 (Timeline)")
+    st.caption("각 곡의 재생 구간을 조절하거나 사이사이에 들어가는 트랜지션을 미리듣고 변경할 수 있습니다.")
+    
+    playlist = st.session_state['playlist']
+    final_specs = []
+    
+    # Callback to handle transition re-rendering when In/Out sliders change
+    def on_timing_change(track_idx):
+        idx = track_idx - 1
+        cw = {'types': st.session_state['type_weights'], 'bars': st.session_state['bar_weights']}
+        if idx >= 0:
+            playlist[idx]['play_end'] = playlist[idx].get('manual_out', playlist[idx]['duration'])
+            opts = transition_engine.generate_random_candidates(playlist[idx], playlist[idx+1], count=6, weights=cw)
+            opts[0]['preview_path'] = renderer.render_preview(playlist[idx]['filepath'], playlist[idx+1]['filepath'], opts[0])
+            st.session_state['candidates'][idx] = opts
+            st.session_state[f"trans_{idx}"] = 0
+            
+        if track_idx < len(playlist) - 1:
+            playlist[track_idx]['play_start'] = playlist[track_idx].get('manual_in', 0)
+            opts = transition_engine.generate_random_candidates(playlist[track_idx], playlist[track_idx+1], count=6, weights=cw)
+            opts[0]['preview_path'] = renderer.render_preview(playlist[track_idx]['filepath'], playlist[track_idx+1]['filepath'], opts[0])
+            st.session_state['candidates'][track_idx] = opts
+            st.session_state[f"trans_{track_idx}"] = 0
+
+    for i, track in enumerate(playlist):
+        # 1. TRACK UI
+        vol_info = f"{track.get('loudness_db', -99):.1f}dB"
+        dur = float(track['duration'])
+        
+        with st.container(border=True):
+            col1, col2 = st.columns([5, 1])
+            col1.markdown(f"**🎵 {i+1}. {track['filename'][:60]}**")
+            col2.markdown(f"`{float(track['bpm']):.0f} BPM` | `{track.get('key', '?')}`")
+            
+            with st.expander(f"⚙️ 곡 재생 구간 조절 (현재: ~{int(track.get('manual_out', dur) - track.get('manual_in', 0))}초)"):
+                m_in = st.slider("시작 (초)", 0.0, dur, track.get('manual_in', 0.0), key=f"in_{i}")
+                m_out = st.slider("종료 (초)", 0.0, dur, track.get('manual_out', dur), key=f"out_{i}")
+                if m_in != track.get('manual_in', 0.0) or m_out != track.get('manual_out', dur):
                     track['manual_in'] = m_in
-                    st.session_state['candidates'] = [] # Reset candidates if timing changes
-                if m_out != cur_out: 
+                    track['play_start'] = m_in
                     track['manual_out'] = m_out
-                    st.session_state['candidates'] = []
-                
-                st.caption(f"💡 현재 설정: {m_in:.1f}s ~ {m_out:.1f}s (약 {int((m_out-m_in)/60)}분 {int((m_out-m_in)%60)}초)")
-
-        st.divider()
-        # Consolidated Intelligent Mix Button - MOVED HERE
-        if st.button("⚡ ONE-CLICK SMART MIX (Plan & Optimize)", type="primary", use_container_width=True):
-            if len(st.session_state['playlist']) < 2:
-                st.error("Need 2+ tracks!")
-            else:
-                with st.status("🧠 Intelligent Mix Planning (5 Scenarios)...", expanded=True) as status:
-                    # STEP 1: Deep Smart Sort (Internalized)
-                    status.write("🎯 Step 1: Optimizing track order for harmonic & energy flow...")
-                    playlist = st.session_state['playlist']
-                    type_w, bar_w = st.session_state['type_weights'], st.session_state['bar_weights']
-                    energy_pref = type_w.get('energy_build', 1.0)
-
-                    notes = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-                    note_to_idx = {n: i for i, n in enumerate(notes)}
-
-                    def normalize_energy(track):
-                        raw = track.get('energy', 0.5)
-                        if isinstance(raw, list):
-                            return sum(raw) / len(raw) if raw else 0.5
-                        return float(raw)
-
-                    def get_key_distance(key1, key2):
-                        try:
-                            root1 = key1.split(' ')[0]
-                            root2 = key2.split(' ')[0]
-                            idx1 = note_to_idx[root1]
-                            idx2 = note_to_idx[root2]
-                            diff = abs(idx1 - idx2)
-                            if diff > 6:
-                                diff = 12 - diff
-                            return diff
-                        except Exception:
-                            return 6
-                    
-                    sorted_playlist = [playlist[0]]
-                    remaining = playlist[1:]
-                    while remaining:
-                        current = sorted_playlist[-1]
-                        current_bpm = current['bpm']
-                        current_key = current.get('key', 'C Major')
-                        current_energy = normalize_energy(current)
-                        
-                        scores = []
-                        for track in remaining:
-                            score = 0
-                            dist = get_key_distance(current_key, track.get('key', 'C Major'))
-                            score += max(0, 60 - (dist * 10))
-                            bpm_diff = abs(track['bpm'] - current_bpm)
-                            score += max(0, 20 - bpm_diff)
-                            track_energy = normalize_energy(track)
-                            energy_diff = track_energy - current_energy
-                            if energy_diff > 0: score += (energy_diff * 40 * energy_pref)
-                            else: score += (energy_diff * 10)
-                            scores.append((score, track))
-                        
-                        scores.sort(reverse=True, key=lambda x: x[0])
-                        next_track = scores[0][1]
-                        sorted_playlist.append(next_track)
-                        remaining.remove(next_track)
-                    
-                    st.session_state['playlist'] = sorted_playlist
-                    st.session_state['transitions'] = [None] * (len(sorted_playlist) - 1)
-                    
-                    # STEP 2: Multi-Plan Generation (5 Scenarios for Efficiency)
-                    status.write("🎲 Step 2: Generating and scoring mix scenarios...")
-                    total_pairs = len(st.session_state['playlist']) - 1
-                    custom_weights = {'types': st.session_state['type_weights'], 'bars': st.session_state['bar_weights']}
-                    
-                    best_total_score = -9999
-                    best_full_plan_cands = []
-                    best_full_selections = []
-
-                    num_scenarios = min(5, max(3, total_pairs + 1))  # adaptive for speed/quality balance
-                    for plan_idx in range(num_scenarios):
-                        status.write(f"Evaluating scenario {plan_idx+1}/{num_scenarios}...")
-                        plan_score = 0
-                        plan_cands = []
-                        plan_selections = []
-                        cur_entry_times = {i: 0.0 for i in range(len(st.session_state['playlist']))}
-
-                        for i in range(total_pairs):
-                            t_a = st.session_state['playlist'][i]
-                            t_b = st.session_state['playlist'][i+1]
-                            opts = transition_engine.generate_random_candidates(t_a, t_b, count=8, weights=custom_weights)
-                            best = transition_engine.select_best_candidate(opts, weights=custom_weights, min_exit_time=cur_entry_times[i])
-                            plan_score += custom_weights['types'].get(best['type'], 1.0)
-                            plan_cands.append(opts)
-                            plan_selections.append(best)
-                            cur_entry_times[i+1] = best['b_in_time']
-
-                        if plan_score > best_total_score:
-                            best_total_score = plan_score
-                            best_full_plan_cands = plan_cands
-                            best_full_selections = plan_selections
-
-                    # STEP 3: Render and Setup UI
-                    status.write("🎨 Step 3: Preparing best choice previews...")
-                    st.session_state['candidates'] = []
-                    for i, best in enumerate(best_full_selections):
-                        t_a = st.session_state['playlist'][i]
-                        t_b = st.session_state['playlist'][i+1]
-                        if not best.get('preview_path'):
-                            best['preview_path'] = renderer.render_preview(t_a['filepath'], t_b['filepath'], best)
-                        
-                        other_opts = [o for o in best_full_plan_cands[i] if o != best]
-                        reordered_opts = [best] + other_opts
-                        st.session_state['candidates'].append(reordered_opts)
-                        st.session_state[f"trans_{i}"] = 0
-                    
-                    status.update(label=f"✅ Smart Mix Optimized (Scenario Score: {best_total_score:.1f})", state="complete")
-                    st.success("Analysis, Sort, and Planning complete! See results below.")
-                    st.rerun()
-
-    with col_mix:
-        if st.session_state['candidates']:
-            st.subheader("3. Select Transitions")
-            st.info("Listen to options and select your favorite.")
-            
-            final_specs = []
-            
-            for i, opts in enumerate(st.session_state['candidates']):
-                t_a = st.session_state['playlist'][i]
-                t_b = st.session_state['playlist'][i+1]
-                
-                st.markdown(f"#### {i+1}. {t_a['filename']} ➡️ {t_b['filename']}")
-                
-                # Skip if no valid options
-                if not opts:
-                    st.warning("No valid transitions generated for this pair.")
-                    continue
-                
-                # Create columns based on actual number of options (max 3)
-                num_opts = min(len(opts), 3)
-                cols = st.columns(num_opts)
-                selected_idx = 0
-                
-                # Display Players
-                for idx, opt in enumerate(opts[:num_opts]):  # Only show first 3
-                    with cols[idx]:
-                        st.markdown(f"**{opt['name']}**")
-                        if opt.get('preview_path') and os.path.exists(opt['preview_path']):
-                            st.audio(opt['preview_path'], format="audio/mp3")
-                        else:
-                            st.error(f"Error: {opt.get('error', 'Unknown')}")
-                        st.caption(opt['description'])
-
-                # Selection Safety: Reset if index is now out of bounds
-                key = f"trans_{i}"
-                if key in st.session_state and st.session_state[key] >= num_opts:
-                    st.session_state[key] = 0
-
-                selected_idx = st.radio(
-                    f"Select for Pair {i+1}", 
-                    options=list(range(num_opts)),
-                    format_func=lambda x: str(opts[x]['name']),
-                    key=key,
-                    horizontal=True,
-                    label_visibility="collapsed"
-                )
-                
-                final_specs.append(opts[selected_idx])
-            
-            st.markdown("---")
-            st.subheader("🎵 Generate Final Mix")
-            
-            # Show mix preview
-            total_duration = sum([spec.get('duration', 10) for spec in final_specs])
-            st.info(f"**Mix Preview:** {len(st.session_state['playlist'])} tracks • ~{total_duration/60:.1f} min • {len(final_specs)} transitions")
-            
-            if st.button("🎧 Generate Final Club Mix (MP3 + LRC)", key="gen_mix"):
-                with st.spinner("🎛️ Rendering final mix... This may take a few minutes."):
-                    out_dir = Path("output")
-                    out_dir.mkdir(exist_ok=True)
-                    
-                    # Generate filename with timestamp
-                    import datetime
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    out_path = str(out_dir / f"club_mix_{timestamp}.mp3")
-                    
-                    try:
-                        result = renderer.render_final_mix(
-                            st.session_state['playlist'], 
-                            final_specs, 
-                            out_path
-                        )
-                        
-                        # Fix: Get paths correctly from result
-                        if isinstance(result, tuple):
-                            mp3_gen, lrc_gen = result
-                        else:
-                            mp3_gen = result
-                            lrc_gen = result.replace(".mp3", ".lrc")
-
-                        st.session_state['final_mix_result'] = {
-                            'mp3': mp3_gen,
-                            'lrc': lrc_gen,
-                            'timestamp': timestamp
-                        }
-                        
-                        # Create ZIP package
-                        zip_path = mp3_gen.replace(".mp3", ".zip")
-                        with zipfile.ZipFile(zip_path, 'w') as zipf:
-                            zipf.write(mp3_gen, os.path.basename(mp3_gen))
-                            if os.path.exists(lrc_gen):
-                                zipf.write(lrc_gen, os.path.basename(lrc_gen))
-                        st.session_state['final_mix_result']['zip'] = zip_path
-                        
-                        st.success("✅ Mix Generated Successfully!")
+                    track['play_end'] = m_out
+                    if st.button("🔄 이 곡 주변 트랜지션 다시 계산", key=f"recalc_{i}"):
+                        on_timing_change(i)
                         st.rerun()
-                        
-                    except Exception as e:
-                        st.error(f"Render Error: {e}")
-                        logger.error(f"Render Error: {e}")
 
-            # Persistent Download UI
-            if st.session_state['final_mix_result']:
-                res = st.session_state['final_mix_result']
-                st.markdown("---")
-                st.subheader("🎉 Your Mix is Ready!")
+        # 2. TRANSITION UI (Between tracks)
+        if i < len(playlist) - 1:
+            opts = st.session_state['candidates'][i]
+            # Ensure valid selection index
+            sel_key = f"trans_{i}"
+            if sel_key not in st.session_state or st.session_state[sel_key] >= len(opts):
+                st.session_state[sel_key] = 0
+            cur_idx = st.session_state[sel_key]
+            active_trans = opts[cur_idx]
+            
+            final_specs.append(active_trans)
+            
+            icon = {"crossfade": "🔀", "bass_swap": "🔊", "cut": "✂️", "filter_fade": "🌊", "mashup": "🎚️"}.get(active_trans['type'], "🎛️")
+            st.markdown(f"<div style='text-align: center; color: gray; margin: 10px 0;'> ⬇️ 연결: {icon} {active_trans['name']} ({active_trans.get('duration',0):.1f}s) ⬇️ </div>", unsafe_allow_html=True)
+            
+            with st.expander(f"🔀 트랜지션 변경: {active_trans['name']}"):
+                col_play, col_opts = st.columns([1, 2])
+                with col_play:
+                    if active_trans.get('preview_path') and os.path.exists(active_trans['preview_path']):
+                        st.audio(active_trans['preview_path'])
+                    else:
+                        if st.button("▶️ 미리듣기 렌더링", key=f"prev_{i}_{cur_idx}", use_container_width=True):
+                            with st.spinner("미리보기 생성 중..."):
+                                active_trans['preview_path'] = renderer.render_preview(playlist[i]['filepath'], playlist[i+1]['filepath'], active_trans)
+                            st.rerun()
                 
-                col_dl, col_info = st.columns([1, 1])
-                
-                with col_dl:
-                    if 'zip' in res and os.path.exists(res['zip']):
-                        with open(res['zip'], "rb") as f:
-                            st.download_button(
-                                "📥 Download FULL PACK (MP3 + LRC)",
-                                f,
-                                file_name=os.path.basename(res['zip']),
-                                mime="application/zip",
-                                type="primary",
-                                use_container_width=True
-                            )
-                    
-                    sub_col1, sub_col2 = st.columns(2)
-                    with sub_col1:
-                        if os.path.exists(res['mp3']):
-                            with open(res['mp3'], "rb") as f:
-                                st.download_button("🎵 MP3 Only", f, file_name=os.path.basename(res['mp3']), mime="audio/mpeg", use_container_width=True)
-                    with sub_col2:
-                        if os.path.exists(res['lrc']):
-                            with open(res['lrc'], "rb") as f:
-                                st.download_button("📄 LRC Only", f, file_name=os.path.basename(res['lrc']), mime="text/plain", use_container_width=True)
+                with col_opts:
+                    new_idx = st.radio(
+                        "스타일 변경",
+                        options=list(range(len(opts))),
+                        format_func=lambda x: f"{opts[x]['name']} ({opts[x].get('duration',0):.1f}s)",
+                        key=f"trans_tmp_{i}",
+                        index=cur_idx,
+                        horizontal=True
+                    )
+                    if new_idx != cur_idx:
+                        st.session_state[sel_key] = new_idx
+                        st.rerun()
 
-                with col_info:
-                    st.info(f"💾 **Package Created**: `{res['timestamp']}`\n\n💡 **Tip**: Use the **Full Pack** for the best experience. Load both the MP3 and LRC into your player to see track titles and use 'Lyric Jump' navigation!")
+    st.divider()
+    
+    # 3. GENERATION
+    est_dur = sum([t.get('manual_out', float(t['duration'])) - t.get('manual_in', 0) for t in playlist])
+    est_dur -= sum([s.get('duration', 0) for s in final_specs])
+    st.subheader(f"3. 최종 렌더링 (예상 길이: {int(est_dur//60)}분 {int(est_dur%60)}초)")
+    
+    if st.button("🎧 최종 DJ 믹스 생성 (MP3 + 타임스탬프)", type="primary", use_container_width=True):
+        with st.spinner("🎛️ 렌더링 중... 수 분이 소요될 수 있습니다."):
+            out_dir = Path("output")
+            out_dir.mkdir(exist_ok=True)
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            out_path = str(out_dir / f"semi_auto_mix_{timestamp}.mp3")
+            
+            try:
+                result = renderer.render_final_mix(playlist, final_specs, out_path)
+                mp3_gen = result[0] if isinstance(result, tuple) else result
+                lrc_gen = result[1] if isinstance(result, tuple) else result.replace(".mp3", ".lrc")
+                
+                zip_path = mp3_gen.replace(".mp3", ".zip")
+                with zipfile.ZipFile(zip_path, 'w') as zipf:
+                    zipf.write(mp3_gen, os.path.basename(mp3_gen))
+                    if os.path.exists(lrc_gen): zipf.write(lrc_gen, os.path.basename(lrc_gen))
+                
+                st.session_state['final_mix_result'] = {'mp3': mp3_gen, 'lrc': lrc_gen, 'timestamp': timestamp, 'zip': zip_path}
+                st.success("✅ 완료!")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Render Error: {e}")
+                
+    if st.session_state['final_mix_result']:
+        res = st.session_state['final_mix_result']
+        st.success(f"🎉 믹스 준비 완료! ({res['timestamp']})")
+        if os.path.exists(res.get('mp3', '')): st.audio(res['mp3'])
+        if os.path.exists(res.get('zip', '')):
+            with open(res['zip'], "rb") as f:
+                st.download_button("📥 다운로드 (MP3 + 가사연동 파일)", f, file_name=os.path.basename(res['zip']), mime="application/zip", use_container_width=True)
+
