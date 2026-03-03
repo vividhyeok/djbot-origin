@@ -149,6 +149,15 @@ def smart_sort_playlist(playlist):
 def format_time(sec):
     return f"{int(sec//60):02d}:{int(sec%60):02d}"
 
+def parse_time_str(time_str):
+    try:
+        if ':' in time_str:
+            m, s = time_str.split(':')
+            return int(m) * 60 + float(s)
+        return float(time_str)
+    except:
+        return 0.0
+
 def dedup_tracks(tracks):
     seen = set()
     result = []
@@ -313,8 +322,20 @@ for i, track in enumerate(playlist):
     with st.expander(f"🎵 {i+1}. {track['filename'][:60]} | {float(track['bpm']):.0f} BPM | {track.get('key', '?')} (길이: {format_time(dur)})", expanded=False):
         st.audio(track['filepath'], format="audio/mp3")
         
-        m_in = st.slider(f"시작 시간", 0.0, dur, track.get('manual_in', 0.0), key=f"s_in_{i}")
-        m_out = st.slider(f"종료 시간", 0.0, dur, track.get('manual_out', dur), key=f"s_out_{i}")
+        # Using columns for text inputs
+        col_t1, col_t2 = st.columns(2)
+        with col_t1:
+            m_in_str = st.text_input("▶️ 시작 시간 (MM:SS 또는 초)", value=format_time(track.get('manual_in', 0.0)), key=f"t_in_{i}")
+        with col_t2:
+            m_out_str = st.text_input("⏹️ 종료 시간 (MM:SS 또는 초)", value=format_time(track.get('manual_out', dur)), key=f"t_out_{i}")
+            
+        m_in = parse_time_str(m_in_str)
+        m_out = parse_time_str(m_out_str)
+        
+        # Validation checks
+        if m_out > dur: m_out = dur
+        if m_in < 0: m_in = 0.0
+        if m_in >= m_out: m_in = max(0.0, m_out - 10.0) # Prevent invalid ranges
         
         if m_in != track.get('manual_in', 0.0) or m_out != track.get('manual_out', dur):
             track['manual_in'] = m_in
